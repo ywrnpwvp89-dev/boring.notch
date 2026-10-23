@@ -190,7 +190,9 @@ class BoringViewModel: NSObject, ObservableObject {
     }
 
     func open() {
-        self.notchSize = openNotchSize
+        let codex = CodexActivityManager.shared
+        codex.isShowingDetails = codex.isEnabled && codex.hasFolderAccess && coordinator.currentView == .home
+        self.notchSize = codex.isShowingDetails ? codexOpenNotchSize : openNotchSize
         self.notchState = .open
         
         // Force music information update when notch is opened

@@ -30,6 +30,9 @@ struct SettingsView: View {
                 NavigationLink(value: "General") {
                     Label("General", systemImage: "gear")
                 }
+                NavigationLink(value: "Codex") {
+                    Label("Codex", systemImage: "terminal.fill")
+                }
                 NavigationLink(value: "Appearance") {
                     Label("Appearance", systemImage: "eye")
                 }
@@ -73,6 +76,8 @@ struct SettingsView: View {
                 switch selectedTab {
                 case "General":
                     GeneralSettings()
+                case "Codex":
+                    CodexActivitySettingsView()
                 case "Appearance":
                     Appearance()
                 case "Media":
