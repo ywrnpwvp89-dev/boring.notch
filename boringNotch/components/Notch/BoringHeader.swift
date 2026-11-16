@@ -9,6 +9,7 @@ import Defaults
 import SwiftUI
 
 struct BoringHeader: View {
+    @ObservedObject private var codex = CodexActivityManager.shared
     @EnvironmentObject var vm: BoringViewModel
     @ObservedObject var batteryModel = BatteryStatusViewModel.shared
     @ObservedObject var coordinator = BoringViewCoordinator.shared
@@ -42,6 +43,19 @@ struct BoringHeader: View {
                         OpenNotchHUD(type: $coordinator.sneakPeek.type, value: $coordinator.sneakPeek.value, icon: $coordinator.sneakPeek.icon)
                             .transition(.scale(scale: 0.8).combined(with: .opacity))
                     } else {
+                        if codex.canShowDetails {
+                            Button {
+                                let wasShowing = coordinator.currentView == .home && codex.isShowingDetails
+                                coordinator.currentView = .home
+                                codex.isShowingDetails = !wasShowing
+                            } label: {
+                                Image(systemName: codex.isShowingDetails ? "music.note" : "terminal")
+                                    .foregroundStyle(.white)
+                                    .frame(width: 30, height: 30)
+                            }
+                            .buttonStyle(.plain)
+                            .help(codex.isShowingDetails ? "Music & Calendar" : "Codex conversations")
+                        }
                         if Defaults[.showMirror] {
                             Button(action: {
                                 vm.toggleCameraPreview()

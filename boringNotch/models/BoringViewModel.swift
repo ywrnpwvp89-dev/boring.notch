@@ -190,8 +190,12 @@ class BoringViewModel: NSObject, ObservableObject {
     }
 
     func open() {
+        guard notchState != .open else { return }
         let codex = CodexActivityManager.shared
-        codex.isShowingDetails = codex.isEnabled && codex.hasFolderAccess && coordinator.currentView == .home
+        // Select once per opening; clicks inside the panel preserve manual choices.
+        // Playing media wins, then genuinely running tasks, otherwise normal Home.
+        codex.isShowingDetails = coordinator.currentView == .home
+            && !MusicManager.shared.isPlaying && codex.canShowDetails && codex.activeActivityCount > 0
         self.notchSize = codex.isShowingDetails ? codexOpenNotchSize : openNotchSize
         self.notchState = .open
         

@@ -16,6 +16,13 @@ struct CodexActivity: Identifiable, Equatable {
     let startedAt: Date
     let updatedAt: Date
     let status: CodexTaskStatus
+
+    @MainActor
+    func openConversation() {
+        guard UUID(uuidString: id) != nil,
+              let url = URL(string: "codex://threads/\(id)") else { return }
+        NSWorkspace.shared.open(url)
+    }
 }
 
 enum CodexTaskStatus: String {
@@ -23,11 +30,11 @@ enum CodexTaskStatus: String {
 
     var label: String {
         switch self {
-        case .running: return "运行中"
-        case .completed: return "已完成"
-        case .interrupted: return "已暂停"
-        case .failed: return "出错"
-        case .idle: return "空闲"
+        case .running: return "Running"
+        case .completed: return "Completed"
+        case .interrupted: return "Interrupted"
+        case .failed: return "Failed"
+        case .idle: return "Idle"
         }
     }
 
@@ -42,6 +49,9 @@ enum CodexTaskStatus: String {
     }
 }
 
+struct CodexQuotaWindow: Equatable, Sendable { let remaining: Int; let resetsAt: Date? }
+struct CodexQuota: Equatable, Sendable { let fiveHour: CodexQuotaWindow?; let weekly: CodexQuotaWindow?; let observedAt: Date }
+
 @MainActor
 final class CodexActivityManager: ObservableObject {
     static let shared = CodexActivityManager()
@@ -49,6 +59,8 @@ final class CodexActivityManager: ObservableObject {
     private static let folderBookmarkKey = "codexActivityFolderBookmark"
     private static let enabledKey = "codexActivityEnabled"
 
+    @Published private(set) var quota: CodexQuota?
+    private var lastQuotaRefresh = Date.distantPast
     @Published private(set) var recentActivities: [CodexActivity] = []
     @Published private(set) var activeActivities: [CodexActivity] = []
     @Published private(set) var activeActivityCount = 0
@@ -77,6 +89,11 @@ final class CodexActivityManager: ObservableObject {
         if isAccessingSecurityScopedResource {
             codexFolderURL?.stopAccessingSecurityScopedResource()
         }
+    }
+
+    /// Only offer the task panel when a healthy connection has real content.
+    var canShowDetails: Bool {
+        isEnabled && hasFolderAccess && errorMessage == nil && !recentActivities.isEmpty
     }
 
     var primaryActivityTitle: String {
@@ -125,6 +142,8 @@ final class CodexActivityManager: ObservableObject {
             recentActivities = []
             activeActivities = []
             activeActivityCount = 0
+            quota = nil
+            lastQuotaRefresh = .distantPast
             isShowingDetails = false
             if isAccessingSecurityScopedResource {
                 codexFolderURL?.stopAccessingSecurityScopedResource()
@@ -139,8 +158,11 @@ final class CodexActivityManager: ObservableObject {
             codexFolderURL?.stopAccessingSecurityScopedResource()
         }
         codexFolderURL = nil
+        quota = nil
+        lastQuotaRefresh = .distantPast
         isAccessingSecurityScopedResource = false
         hasFolderAccess = false
+        isShowingDetails = false
         recentActivities = []
         activeActivities = []
         activeActivityCount = 0
@@ -198,6 +220,8 @@ final class CodexActivityManager: ObservableObject {
                 codexFolderURL?.stopAccessingSecurityScopedResource()
             }
             codexFolderURL = readOnlyFolderURL
+            quota = nil
+            lastQuotaRefresh = .distantPast
             isAccessingSecurityScopedResource = isEnabled
             hasFolderAccess = isEnabled
             errorMessage = nil
@@ -217,14 +241,26 @@ final class CodexActivityManager: ObservableObject {
             recentActivities = []
             activeActivities = []
             activeActivityCount = 0
+            isShowingDetails = false
             return
         }
 
+        if Date().timeIntervalSince(lastQuotaRefresh) >= 30 {
+            lastQuotaRefresh = Date()
+            Task { [weak self] in
+                let value = await Task.detached(priority: .utility) {
+                    CodexActivityScanner.readQuota(in: codexFolderURL)
+                }.value
+                guard let self, self.isEnabled, self.codexFolderURL == codexFolderURL else { return }
+                self.quota = value
+            }
+        }
         let snapshot = CodexActivityScanner.scan(in: codexFolderURL)
         recentActivities = snapshot.activities
         activeActivities = snapshot.activities.filter { $0.status == .running }
         activeActivityCount = snapshot.totalCount
         errorMessage = snapshot.errorMessage
+        if !canShowDetails { isShowingDetails = false }
     }
 
     private func restoreFolderBookmark() {
@@ -269,6 +305,37 @@ private struct CodexActivitySnapshot {
 /// Reads only task titles and turn status from Codex's local SQLite indexes.
 /// Connections are opened read-only; prompt and response contents are never queried.
 private enum CodexActivityScanner {
+    static func readQuota(in folder: URL) -> CodexQuota? {
+        guard let files = FileManager.default.enumerator(at: folder.appendingPathComponent("sessions"), includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]) else { return nil }
+        let urls = files.compactMap { $0 as? URL }.filter { $0.pathExtension == "jsonl" }.sorted {
+            ((try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) > ((try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
+        }
+        let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var latest: CodexQuota?
+        for url in urls.prefix(20) {
+            guard let handle = try? FileHandle(forReadingFrom: url) else { continue }
+            defer { try? handle.close() }
+            guard let length = try? handle.seekToEnd() else { continue }
+            try? handle.seek(toOffset: length > 524288 ? length - 524288 : 0)
+            guard let data = try? handle.readToEnd() else { continue }
+            let contents = String(decoding: data, as: UTF8.self)
+            for line in contents.split(separator: "\n").reversed() where line.contains("\"rate_limits\"") {
+                guard let object = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any], object["type"] as? String == "event_msg", let payload = object["payload"] as? [String: Any], payload["type"] as? String == "token_count", let limits = payload["rate_limits"] as? [String: Any], let timestamp = object["timestamp"] as? String, let date = formatter.date(from: timestamp), (limits["limit_id"] as? String ?? "codex") == "codex" else { continue }
+                func window(_ minutes: Int) -> CodexQuotaWindow? {
+                    for key in ["primary", "secondary"] {
+                        guard let value = limits[key] as? [String: Any], value["window_minutes"] as? Int == minutes, let used = value["used_percent"] as? Double else { continue }
+                        if let reset = value["resets_at"] as? Double, reset <= Date().timeIntervalSince1970 { return nil }
+                        return CodexQuotaWindow(remaining: max(0, min(100, Int((100-used).rounded()))), resetsAt: (value["resets_at"] as? Double).map { Date(timeIntervalSince1970: $0) })
+                    }
+                    return nil
+                }
+                let five = window(300), week = window(10080)
+                if (five != nil || week != nil), latest.map({ date > $0.observedAt }) ?? true { latest = CodexQuota(fiveHour: five, weekly: week, observedAt: date) }
+                break
+            }
+        }
+        return latest
+    }
     private static let maximumActivityAge: TimeInterval = 24 * 60 * 60
     private static let maximumDisplayedActivities = 12
     private static var sessionMap: [String: String] = [:]
@@ -443,44 +510,54 @@ struct CodexLiveActivityView: View {
 
     var body: some View {
         Button {
-            manager.isShowingDetails = true
-            viewModel.open()
+            manager.activeActivities.first?.openConversation()
         } label: {
-            HStack(spacing: 10) {
-                Image(systemName: "terminal.fill")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .frame(width: 34, height: 34)
-                    .background(.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 9))
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(manager.primaryActivityTitle)
-                        .font(.headline)
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                    Text(manager.activeActivityCount == 1 ? "Codex is working" : "\(manager.activeActivityCount) tasks running")
-                        .font(.subheadline)
-                        .foregroundStyle(.gray)
-                        .lineLimit(1)
+            GeometryReader { geometry in
+                let gap = min(viewModel.closedNotchSize.width, geometry.size.width * 0.45)
+                let side = max(0, (geometry.size.width - gap - 24) / 2)
+                HStack(spacing: 0) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "terminal.fill")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 34, height: 34)
+                            .background(.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 9))
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(manager.primaryActivityTitle)
+                                .font(.headline).foregroundStyle(.white)
+                                .lineLimit(1).truncationMode(.tail)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Text(manager.activeActivityCount == 1 ? "Codex is working" : "\(manager.activeActivityCount) tasks running")
+                                .font(.subheadline).foregroundStyle(.gray).lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .clipped()
+                    }
+                    .frame(width: side, alignment: .leading)
+                    .clipped()
+                    Color.clear.frame(width: gap)
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(manager.quota?.fiveHour.map { "5h \($0.remaining)% left" } ?? "5h —")
+                            .font(.caption.weight(.semibold)).foregroundStyle(.white)
+                        if let reset = manager.quota?.fiveHour?.resetsAt {
+                            Text("Resets \(reset.formatted(date: .omitted, time: .shortened))")
+                                .font(.caption2).foregroundStyle(.gray)
+                        } else {
+                            Text("Reset unavailable").font(.caption2).foregroundStyle(.gray)
+                        }
+                    }
+                    .lineLimit(1)
+                    .frame(width: side, alignment: .trailing)
+                    .clipped()
                 }
-
-                Spacer(minLength: 5)
-                if manager.activeActivityCount > 1 {
-                    Text("\(manager.activeActivityCount)")
-                        .font(.system(.headline, design: .rounded))
-                        .foregroundStyle(.white)
-                }
-                ProgressView()
-                    .controlSize(.small)
-                    .tint(.white)
+                .padding(.horizontal, 12)
+                .frame(height: geometry.size.height)
             }
-            .padding(.horizontal, 12)
-            .frame(maxWidth: .infinity)
             .frame(height: max(38, viewModel.effectiveClosedNotchHeight))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("Show active Codex tasks")
+        .help("Open this conversation in Codex")
     }
 }
 
@@ -490,19 +567,27 @@ struct CodexActivityDetailsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Label("Codex 对话", systemImage: "terminal.fill")
+                Label("Codex conversations", systemImage: "terminal.fill")
                     .font(.headline).foregroundStyle(.white)
-                Text("\(manager.activeActivityCount) 运行中")
+                Text("\(manager.activeActivityCount) running")
                     .font(.caption).foregroundStyle(.green)
                 Spacer()
                 Button {
                     manager.isShowingDetails = false
                 } label: {
-                    Label("音乐与日历", systemImage: "music.note")
+                    Label("Music & Calendar", systemImage: "music.note")
                         .font(.caption).foregroundStyle(.white.opacity(0.7))
                 }
                 .buttonStyle(.plain)
             }
+            if let quota = manager.quota {
+                HStack(spacing: 16) {
+                    quotaLabel("5h", quota.fiveHour)
+                    quotaLabel("Week", quota.weekly)
+                    Spacer()
+                    Text("Updated \(quota.observedAt.formatted(date: .abbreviated, time: .shortened))").font(.caption2).foregroundStyle(.secondary)
+                }
+            } else { Text("Usage unavailable").font(.caption).foregroundStyle(.secondary) }
             if manager.recentActivities.isEmpty {
                 Text(manager.statusDescription).font(.subheadline).foregroundStyle(.secondary)
             } else {
@@ -519,8 +604,14 @@ struct CodexActivityDetailsView: View {
                                         .frame(width: 18)
                                 }
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text(activity.title).font(.subheadline.weight(.medium))
-                                        .foregroundStyle(.white).lineLimit(1)
+                                    Button {
+                                        activity.openConversation()
+                                    } label: {
+                                        Text(activity.title).font(.subheadline.weight(.medium))
+                                            .foregroundStyle(.white).lineLimit(1)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Open this conversation in Codex")
                                     Text("\(activity.status.label) · \(Self.elapsedTime(since: activity.status == .running ? activity.startedAt : activity.updatedAt))")
                                         .font(.caption).foregroundStyle(activity.status.color)
                                 }
@@ -542,12 +633,19 @@ struct CodexActivityDetailsView: View {
         .background(.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 16))
     }
 
+    private func quotaLabel(_ title: String, _ quota: CodexQuotaWindow?) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("\(title): \(quota.map { "\($0.remaining)% left" } ?? "Unavailable")").font(.caption.weight(.semibold)).foregroundStyle(.white)
+            if let reset = quota?.resetsAt { Text("Resets \(reset.formatted(date: .abbreviated, time: .shortened))").font(.caption2).foregroundStyle(.secondary) }
+        }
+    }
+
     private static func elapsedTime(since start: Date) -> String {
         let seconds = max(0, Int(Date().timeIntervalSince(start)))
-        if seconds < 60 { return "\(seconds) 秒" }
-        if seconds < 3_600 { return "\(seconds / 60) 分钟" }
-        if seconds < 86_400 { return "\(seconds / 3_600) 小时" }
-        return "\(seconds / 86_400) 天"
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3_600 { return "\(seconds / 60)m" }
+        if seconds < 86_400 { return "\(seconds / 3_600)h" }
+        return "\(seconds / 86_400)d"
     }
 }
 
